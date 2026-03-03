@@ -99,10 +99,6 @@ export const ChatInterface = React.memo<ChatInterfaceProps>(({ assistant }) => {
   // Stores the message count at the moment the delay panel appeared, so we can
   // detect new AI messages arriving while isLoading is still true.
   const msgCountAtDelayRef = useRef(0);
-  // When true, clear the panel only after the typing animation finishes.
-  const clearAfterTypingRef = useRef(false);
-  // Declared here, updated below after isLoading is available.
-  const isLoadingRef = useRef(false);
   const { scrollRef, contentRef } = useStickToBottom();
 
   const {
@@ -119,9 +115,6 @@ export const ChatInterface = React.memo<ChatInterfaceProps>(({ assistant }) => {
     stopStream,
     resumeInterrupt,
   } = useChatContext();
-
-  // Always-current isLoading value — safe to read inside stale interval closures.
-  isLoadingRef.current = isLoading;
 
   const submitDisabled = isLoading || !assistant;
 
@@ -298,7 +291,6 @@ export const ChatInterface = React.memo<ChatInterfaceProps>(({ assistant }) => {
     if (delayTimerRef.current) clearTimeout(delayTimerRef.current);
     delayShownRef.current = false;
     msgCountAtDelayRef.current = 0;
-    clearAfterTypingRef.current = false;
     setDelayMessage(null);
     setTypedText("");
   }, []);
@@ -337,16 +329,10 @@ export const ChatInterface = React.memo<ChatInterfaceProps>(({ assistant }) => {
     if (!delayShownRef.current) return;
     const currentCount = stream.values?.messages?.length ?? 0;
     if (currentCount > msgCountAtDelayRef.current) {
-      if (typedText.length >= (delayMessage?.length ?? 0)) {
-        // Animation already finished — clear immediately.
-        clearDelayPanel();
-        if (isLoading) setTimerEpoch((e) => e + 1);
-      } else {
-        // Animation still running — let it finish, then the interval will clear.
-        clearAfterTypingRef.current = true;
-      }
+      clearDelayPanel();
+      if (isLoading) setTimerEpoch((e) => e + 1);
     }
-  }, [stream.values?.messages, clearDelayPanel, isLoading, typedText, delayMessage]);
+  }, [stream.values?.messages, clearDelayPanel, isLoading]);
 
   // ADDED: Typing animation effect — types out delayMessage one character at a
   // time (35 ms per char). Resets whenever delayMessage is replaced or cleared.
@@ -362,13 +348,6 @@ export const ChatInterface = React.memo<ChatInterfaceProps>(({ assistant }) => {
         setTypedText(delayMessage.slice(0, i));
       } else {
         if (typingIntervalRef.current) clearInterval(typingIntervalRef.current);
-        // If an AI message arrived while we were typing, clear the panel now
-        // that the animation has gracefully finished.
-        if (clearAfterTypingRef.current) {
-          clearAfterTypingRef.current = false;
-          clearDelayPanel();
-          if (isLoadingRef.current) setTimerEpoch((e) => e + 1);
-        }
       }
     }, 35);
     return () => {

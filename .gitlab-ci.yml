@@ -1,0 +1,128 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# deep-agents-ui  |  GitLab CI/CD Pipeline
+#
+# Stages:
+#   lint    → ESLint + Prettier check (runs on every MR and main push)
+#   build   → Build Docker image and push to GitLab Container Registry
+#   deploy  → Deploy to staging (auto) and production (manual gate)
+#
+# Required CI/CD Variables (Settings → CI/CD → Variables):
+#   STAGING_HOST       — SSH hostname / IP of the staging server
+#   PRODUCTION_HOST    — SSH hostname / IP of the production server
+#   DEPLOY_USER        — SSH user on the remote servers
+#   SSH_PRIVATE_KEY    — Private key for the deploy user (masked)
+#   NEXT_PUBLIC_API_URL — Runtime API base URL injected at build time
+# ─────────────────────────────────────────────────────────────────────────────
+
+stages:
+  - lint
+  - build
+  - deploy
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  # Full image tag: registry/namespace/project:branch-slug
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+  IMAGE_LATEST: $CI_REGISTRY_IMAGE:latest
+
+# ── Shared Node cache ─────────────────────────────────────────────────────────
+.node_cache: &node_cache
+  cache:
+    key:
+      files:
+        - yarn.lock
+    paths:
+      - node_modules/
+    policy: pull-push
+
+# ─── Lint ─────────────────────────────────────────────────────────────────────
+lint:
+  stage: lint
+  image: node:20-alpine
+  <<: *node_cache
+  before_script:
+    - yarn install --frozen-lockfile
+  script:
+    - yarn lint
+    - yarn format:check
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ─── Build Docker image ───────────────────────────────────────────────────────
+build:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - |
+      docker build \
+        --build-arg NEXT_PUBLIC_API_URL="$NEXT_PUBLIC_API_URL" \
+        --cache-from "$IMAGE_LATEST" \
+        --tag "$IMAGE_TAG" \
+        .
+    - docker push "$IMAGE_TAG"
+    # Tag as :latest only on main branch
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker tag "$IMAGE_TAG" "$IMAGE_LATEST"
+        docker push "$IMAGE_LATEST"
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# ─── Deploy helpers ───────────────────────────────────────────────────────────
+.deploy_template: &deploy_template
+  stage: deploy
+  image: alpine:3.19
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+  script:
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_HOST" "
+        set -e
+        docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+        docker pull $IMAGE_TAG
+        docker stop  deep-agents-ui 2>/dev/null || true
+        docker rm    deep-agents-ui 2>/dev/null || true
+        docker run -d \
+          --name deep-agents-ui \
+          --restart unless-stopped \
+          -p 3000:3000 \
+          --env-file /opt/deep-agents-ui/.env \
+          $IMAGE_TAG
+        docker image prune -f
+      "
+
+# ─── Deploy → Staging (automatic on main) ────────────────────────────────────
+deploy:staging:
+  <<: *deploy_template
+  environment:
+    name: staging
+    url: https://staging.your-domain.com
+  variables:
+    DEPLOY_HOST: $STAGING_HOST
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ─── Deploy → Production (manual gate on main) ───────────────────────────────
+deploy:production:
+  <<: *deploy_template
+  environment:
+    name: production
+    url: https://your-domain.com
+  variables:
+    DEPLOY_HOST: $PRODUCTION_HOST
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+  allow_failure: false

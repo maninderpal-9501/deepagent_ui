@@ -1,9 +1,10 @@
+
+
 "use client";
 
 import React, {
   useState,
   useRef,
-  useEffect,
   useCallback,
   useMemo,
   FormEvent,
@@ -36,20 +37,6 @@ interface ChatInterfaceProps {
   assistant: Assistant | null;
 }
 
-// 8 creative messages shown in the right panel after a 20-second delay.
-// {todo} is replaced at runtime with the first pending todo's content.
-const DELAY_MESSAGES = [
-  `Still brewing results for "{todo}" ☕ — grab a coffee, this one's a deep thinker.`,
-  `Your AI is fully lost in "{todo}" 🔍 — perfect time to stretch those legs!`,
-  `Untangling "{todo}" thread by thread 🧵 — why not refill that water bottle?`,
-  `"{todo}" has the AI in philosopher mode 🧠 — you've earned a snack break.`,
-  `Wrestling with "{todo}" 🏋️ — the AI is giving it absolutely everything it's got.`,
-  `Running heavy analysis on "{todo}" ⚙️ — patience is a virtue (coffee makes it easier).`,
-  `Laser-focused on "{todo}" 🎯 — this is a good time to blink, you haven't in a while.`,
-  `Deep in the weeds with "{todo}" 🌿 — pour something warm, we'll be right back.`,
-  `"{todo}" demands serious brain power 💡 — a quick lap around the office might help!`,
-  `The numbers behind "{todo}" don't lie, but they do take time 📊 — sit tight, we've got this.`,
-];
 const getStatusIcon = (status: TodoItem["status"], className?: string) => {
   switch (status) {
     case "completed":
@@ -82,27 +69,6 @@ export const ChatInterface = React.memo<ChatInterfaceProps>(({ assistant }) => {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const [input, setInput] = useState("");
-
-  // ADDED: state for the right-panel delay message and its typing animation
-  const [delayMessage, setDelayMessage] = useState<string | null>(null);
-  const [typedText, setTypedText] = useState("");
-  // Incremented each time the panel is dismissed by an arriving AI message
-  // (not by isLoading going false). Adding it to the timer effect's deps
-  // forces the effect to re-run and start a fresh 20-second countdown for
-  // any subsequent delay in the same stream.
-  const [timerEpoch, setTimerEpoch] = useState(0);
-  const delayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const typingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Tracks whether the delay message is already on screen so we don't restart
-  // the callback while the user is reading it.
-  const delayShownRef = useRef(false);
-  // Stores the message count at the moment the delay panel appeared, so we can
-  // detect new AI messages arriving while isLoading is still true.
-  const msgCountAtDelayRef = useRef(0);
-  // When true, clear the panel only after the typing animation finishes.
-  const clearAfterTypingRef = useRef(false);
-  // Declared here, updated below after isLoading is available.
-  const isLoadingRef = useRef(false);
   const { scrollRef, contentRef } = useStickToBottom();
 
   const {
@@ -119,9 +85,6 @@ export const ChatInterface = React.memo<ChatInterfaceProps>(({ assistant }) => {
     stopStream,
     resumeInterrupt,
   } = useChatContext();
-
-  // Always-current isLoading value — safe to read inside stale interval closures.
-  isLoadingRef.current = isLoading;
 
   const submitDisabled = isLoading || !assistant;
 
@@ -263,119 +226,6 @@ export const ChatInterface = React.memo<ChatInterfaceProps>(({ assistant }) => {
   const hasTasks = todos.length > 0;
   const hasFiles = Object.keys(files).length > 0;
 
-  // ADDED: Walk stream.values.messages in reverse to find the most recent AI
-  // message that carries reasoning_content in its additional_kwargs.
-  // Returns null when no such message exists yet.
-  // Recomputes only when the messages list reference changes (new streamed chunk).
-  const latestReasoning = useMemo<string | null>(() => {
-    const msgs = stream.values?.messages ?? [];
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const msg = msgs[i];
-      if (msg.type === "ai") {
-        const r = (msg as any).additional_kwargs?.reasoning_content;
-        if (r) return r as string;
-      }
-    }
-    return null;
-  }, [stream.values?.messages]);
-
-  // ADDED: Always-current refs so timer callbacks read live values without
-  // needing them in effect dependency arrays (which would restart the timer).
-  const buildDelayMessageRef = useRef<() => string>(() => "");
-  buildDelayMessageRef.current = () => {
-    const pending = groupedTodos.pending;
-    const todoText =
-      pending.length > 0 ? pending[0].content : "your request";
-    const template =
-      DELAY_MESSAGES[Math.floor(Math.random() * DELAY_MESSAGES.length)];
-    return template.replace(/\{todo\}/g, todoText);
-  };
-
-  const getMessageCountRef = useRef<() => number>(() => 0);
-  getMessageCountRef.current = () => stream.values?.messages?.length ?? 0;
-
-  const clearDelayPanel = useCallback(() => {
-    if (delayTimerRef.current) clearTimeout(delayTimerRef.current);
-    delayShownRef.current = false;
-    msgCountAtDelayRef.current = 0;
-    clearAfterTypingRef.current = false;
-    setDelayMessage(null);
-    setTypedText("");
-  }, []);
-
-  // ADDED: Timer effect — starts a 20-second countdown when isLoading goes
-  // true. Fires the callback once (delayShownRef guard). Clears everything
-  // when isLoading goes false (entire stream finished).
-  useEffect(() => {
-    if (isLoading) {
-      if (!delayShownRef.current) {
-        delayTimerRef.current = setTimeout(() => {
-          delayShownRef.current = true;
-          // Snapshot the message count so we can detect new arrivals later.
-          msgCountAtDelayRef.current = getMessageCountRef.current();
-          setDelayMessage(buildDelayMessageRef.current());
-          setTypedText("");
-        }, 20000);
-      }
-    } else {
-      clearDelayPanel();
-    }
-    return () => {
-      if (delayTimerRef.current) clearTimeout(delayTimerRef.current);
-    };
-  }, [isLoading, clearDelayPanel, timerEpoch]);
-
-  // ADDED: Message-watching effect — the core of the bug fix.
-  // isLoading stays true for the entire multi-step graph run, so we cannot
-  // rely on it to detect individual AI messages arriving. Instead we watch
-  // stream.values?.messages directly: as soon as the count grows beyond what
-  // it was when the delay panel appeared, a new AI message has come in and we
-  // immediately hide the panel.
-  // After clearing, we bump timerEpoch so the timer effect re-runs and starts
-  // a fresh 20-second countdown for any subsequent delay in the same stream.
-  useEffect(() => {
-    if (!delayShownRef.current) return;
-    const currentCount = stream.values?.messages?.length ?? 0;
-    if (currentCount > msgCountAtDelayRef.current) {
-      if (typedText.length >= (delayMessage?.length ?? 0)) {
-        // Animation already finished — clear immediately.
-        clearDelayPanel();
-        if (isLoading) setTimerEpoch((e) => e + 1);
-      } else {
-        // Animation still running — let it finish, then the interval will clear.
-        clearAfterTypingRef.current = true;
-      }
-    }
-  }, [stream.values?.messages, clearDelayPanel, isLoading, typedText, delayMessage]);
-
-  // ADDED: Typing animation effect — types out delayMessage one character at a
-  // time (35 ms per char). Resets whenever delayMessage is replaced or cleared.
-  useEffect(() => {
-    if (!delayMessage) {
-      setTypedText("");
-      return;
-    }
-    let i = 0;
-    typingIntervalRef.current = setInterval(() => {
-      i++;
-      if (i <= delayMessage.length) {
-        setTypedText(delayMessage.slice(0, i));
-      } else {
-        if (typingIntervalRef.current) clearInterval(typingIntervalRef.current);
-        // If an AI message arrived while we were typing, clear the panel now
-        // that the animation has gracefully finished.
-        if (clearAfterTypingRef.current) {
-          clearAfterTypingRef.current = false;
-          clearDelayPanel();
-          if (isLoadingRef.current) setTimerEpoch((e) => e + 1);
-        }
-      }
-    }, 35);
-    return () => {
-      if (typingIntervalRef.current) clearInterval(typingIntervalRef.current);
-    };
-  }, [delayMessage]);
-
   // Parse out any action requests or review configs from the interrupt
   const actionRequestsMap: Map<string, ActionRequest> | null = useMemo(() => {
     const actionRequests =
@@ -394,48 +244,7 @@ export const ChatInterface = React.memo<ChatInterfaceProps>(({ assistant }) => {
   }, [interrupt]);
 
   return (
-    <div className="flex flex-1 overflow-hidden">
-      {hasTasks && (
-        <aside className="hidden lg:flex w-56 shrink-0 flex-col overflow-y-auto border-r border-border bg-sidebar">
-          <div className="border-b border-border px-4 py-3">
-            <span className="text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">
-              Agent Tasks
-            </span>
-          </div>
-          <div className="flex-1 space-y-4 px-3 py-3">
-            {(
-              [
-                { key: "in_progress", label: "In Progress", items: groupedTodos.in_progress },
-                { key: "pending",     label: "Pending",     items: groupedTodos.pending     },
-                { key: "completed",   label: "Completed",   items: groupedTodos.completed   },
-              ] as const
-            )
-              .filter(({ items }) => items.length > 0)
-              .map(({ key, label, items }) => (
-                <div key={key}>
-                  <h3 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-tertiary">
-                    {label}
-                  </h3>
-                  <div className="space-y-1">
-                    {items.map((todo, index) => (
-                      <div
-                        key={`sidebar_${key}_${todo.id ?? index}`}
-                        className="flex items-start gap-2 rounded-sm px-1 py-1 text-sm"
-                      >
-                        {getStatusIcon(todo.status, "mt-0.5 shrink-0")}
-                        <span className="break-words leading-relaxed text-inherit">
-                          {todo.content}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ))}
-          </div>
-        </aside>
-      )}
-
-      <div className="flex flex-1 flex-col overflow-hidden min-w-0">
+    <div className="flex flex-1 flex-col overflow-hidden">
       <div
         className="flex-1 overflow-y-auto overflow-x-hidden overscroll-contain"
         ref={scrollRef}
@@ -486,51 +295,8 @@ export const ChatInterface = React.memo<ChatInterfaceProps>(({ assistant }) => {
             "mx-auto w-[calc(100%-32px)] max-w-[1024px] transition-colors duration-200 ease-in-out"
           )}
         >
-          {(isLoading || latestReasoning !== null || hasTasks || hasFiles) && (
+          {(hasTasks || hasFiles) && (
             <div className="flex max-h-72 flex-col overflow-y-auto border-b border-border bg-sidebar empty:hidden">
-
-              {/* ADDED: AI Reasoning Panel ─────────────────────────────────
-                  Shown whenever the agent is loading OR has produced reasoning.
-                  • Pulsing ping dot = live indicator while isLoading is true.
-                  • "AI thinking..." placeholder fades in/out via animate-pulse
-                    when no reasoning has arrived yet.
-                  • Once reasoning arrives, the text replaces the placeholder.
-                  • latestReasoning always holds the LAST AI message's content,
-                    so old reasoning is automatically erased by the new one.    */}
-              {(isLoading || latestReasoning) && (
-                <div className="border-b border-border px-[18px] py-3">
-                  {/* Header row with live indicator */}
-                  <div className="mb-2 flex items-center gap-2">
-                    <span className="relative flex h-2 w-2 shrink-0">
-                      {isLoading && (
-                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
-                      )}
-                      <span
-                        className={cn(
-                          "relative inline-flex h-2 w-2 rounded-full",
-                          isLoading ? "bg-blue-500" : "bg-emerald-500"
-                        )}
-                      />
-                    </span>
-                    <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                      AI Reasoning
-                    </span>
-                  </div>
-
-                  {/* Content: placeholder while waiting, actual text once received */}
-                  {latestReasoning ? (
-                    <p className="text-xs leading-relaxed text-muted-foreground transition-all duration-300">
-                      {latestReasoning}
-                    </p>
-                  ) : (
-                    <p className="animate-pulse text-xs text-muted-foreground">
-                      AI thinking.....
-                    </p>
-                  )}
-                </div>
-              )}
-              {/* ─────────────────────────────────────────────────────────── */}
-
               {!metaOpen && (
                 <>
                   {(() => {
@@ -774,32 +540,8 @@ export const ChatInterface = React.memo<ChatInterfaceProps>(({ assistant }) => {
           </form>
         </div>
       </div>
-      </div>
-
-      {/* ADDED: Right-panel — only mounts when a delay message is active.
-          Hidden below xl (1280 px) so it never crowds the chat on smaller
-          screens. The message is typed character-by-character via typedText;
-          the blinking cursor disappears once typing finishes.               */}
-      {delayMessage && isLoading && (
-        <aside className="hidden xl:flex w-64 shrink-0 flex-col items-center justify-center gap-5 border-l border-border bg-sidebar px-6 py-10 text-center">
-          <span className="text-4xl">⏳</span>
-          <p className="text-sm leading-relaxed text-muted-foreground">
-            {typedText}
-            {typedText.length < delayMessage.length && (
-              <span className="animate-pulse font-bold"> |</span>
-            )}
-          </p>
-          <p className="text-[10px] uppercase tracking-widest text-tertiary/60">
-            Still working…
-          </p>
-        </aside>
-      )}
     </div>
   );
 });
 
 ChatInterface.displayName = "ChatInterface";
-
-
-
-

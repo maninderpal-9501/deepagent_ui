@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback } from "react";
+import { useCallback, useMemo } from "react";
 import { useStream } from "@langchain/langgraph-sdk/react";
 import {
   type Message,
@@ -145,9 +145,59 @@ export function useChat({
     stream.stop();
   }, [stream]);
 
+  // Todos are not stored in stream.values.todos.
+  // Instead, the agent writes them via the `write_todos` tool, whose calls are
+  // embedded inside stream.values.messages (the full message list from the graph state).
+  // Each write_todos call carries:
+  //   args.todos  – array of { id, content, status }
+  //   args.merge  – true  → patch existing items by id (status-only updates)
+  //              – false → replace the entire list
+  // We replay every call in order to reconstruct the current todo state.
+  const todos = useMemo<TodoItem[]>(() => {
+    const messages = stream.values?.messages ?? [];
+    let derived: TodoItem[] = [];
+
+    for (const msg of messages) {
+      // Only AI messages contain tool calls
+      if (msg.type !== "ai") continue;
+
+      const toolCalls: any[] = (msg as any).tool_calls ?? [];
+
+      for (const tc of toolCalls) {
+        if (tc.name !== "write_todos") continue;
+
+        const incoming: TodoItem[] = tc.args?.todos ?? [];
+        const isMerge: boolean = tc.args?.merge === true;
+
+        if (!isMerge) {
+          // Full replace – incoming list becomes the new state
+          derived = incoming;
+        } else {
+          // Patch by id – update matching items, append unknown ones.
+          // Merge calls only send changed fields (e.g. just id + status),
+          // so we spread to preserve existing fields like content.
+          const next = [...derived];
+          for (const patch of incoming) {
+            const idx = next.findIndex((t) => t.id === patch.id);
+            if (idx !== -1) {
+              next[idx] = { ...next[idx], ...patch };
+            } else {
+              next.push(patch);
+            }
+          }
+          derived = next;
+        }
+      }
+    }
+
+    return derived;
+  }, [stream.values?.messages]);
+
+  console.log("Stream state::::::::::::::::::::::::", stream.values);
+
   return {
     stream,
-    todos: stream.values.todos ?? [],
+    todos,
     files: stream.values.files ?? {},
     email: stream.values.email,
     ui: stream.values.ui,
